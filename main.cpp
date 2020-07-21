@@ -12,6 +12,7 @@
 #include <d3dcommon.h>
 #include <d3d11.h>
 #include <d3dcompiler.h>
+#include <array>
 
 #ifndef SAFE_RELEASE
 #define SAFE_RELEASE(p)      { if (p) { (p)->Release(); (p)=nullptr; } }
@@ -37,6 +38,7 @@ HRESULT CreateStructuredBuffer( _In_ ID3D11Device* pDevice, _In_ UINT uElementSi
                                 _In_reads_(uElementSize*uCount) void* pInitData,
                                 _Outptr_ ID3D11Buffer** ppBufOut );
 HRESULT CreateRawBuffer( _In_ ID3D11Device* pDevice, _In_ UINT uSize, _In_reads_(uSize) void* pInitData, _Outptr_ ID3D11Buffer** ppBufOut );
+HRESULT CreateConstBuffer(_In_ ID3D11Device* pDevice, _In_ UINT uSize, _In_reads_(uSize) void* pInitData, _Outptr_ ID3D11Buffer** ppBufOut);
 HRESULT CreateBufferSRV( _In_ ID3D11Device* pDevice, _In_ ID3D11Buffer* pBuffer, _Outptr_ ID3D11ShaderResourceView** ppSRVOut );
 HRESULT CreateBufferUAV( _In_ ID3D11Device* pDevice, _In_ ID3D11Buffer* pBuffer, _Outptr_ ID3D11UnorderedAccessView** pUAVOut );
 ID3D11Buffer* CreateAndCopyToDebugBuf( _In_ ID3D11Device* pDevice, _In_ ID3D11DeviceContext* pd3dImmediateContext, _In_ ID3D11Buffer* pBuffer );
@@ -45,6 +47,7 @@ void RunComputeShader( _In_ ID3D11DeviceContext* pd3dImmediateContext,
                        _In_ UINT nNumViews, _In_reads_(nNumViews) ID3D11ShaderResourceView** pShaderResourceViews, 
                        _In_opt_ ID3D11Buffer* pCBCS, _In_reads_opt_(dwNumDataBytes) void* pCSData, _In_ DWORD dwNumDataBytes,
                        _In_ ID3D11UnorderedAccessView* pUnorderedAccessView,
+					   _In_ ID3D11Buffer* pConstantBuffer,
                        _In_ UINT X, _In_ UINT Y, _In_ UINT Z );
 HRESULT FindDXSDKShaderFileCch( _Out_writes_(cchDest) WCHAR* strDestPath,
                                 _In_ int cchDest, 
@@ -57,34 +60,33 @@ ID3D11Device*               g_pDevice = nullptr;
 ID3D11DeviceContext*        g_pContext = nullptr;
 ID3D11ComputeShader*        g_pCS = nullptr;
 
-ID3D11Buffer*               g_pBuf0 = nullptr;
-ID3D11Buffer*               g_pBuf1 = nullptr;
-ID3D11Buffer*               g_pBufResult = nullptr;
+// Particle self shadowing task
+ID3D11Buffer* particlesBuffer = nullptr;
+ID3D11Buffer* shadowBuffer = nullptr;
+ID3D11Buffer* constBuffer = nullptr;
+ID3D11ShaderResourceView* particlesBufferSRV = nullptr;
+ID3D11UnorderedAccessView*  shadowBufferUAV = nullptr;
 
-ID3D11ShaderResourceView*   g_pBuf0SRV = nullptr;
-ID3D11ShaderResourceView*   g_pBuf1SRV = nullptr;
-ID3D11UnorderedAccessView*  g_pBufResultUAV = nullptr;
+#define THREAD_X 32
+#define THREAD_Y 32
 
-struct BufType
-{
-    int i;
-    float f;
-#ifdef TEST_DOUBLE
-    double d;
-#endif
+void CreateIOBuffers();
+void SetUniforms();
+void TestResult();
+
+struct Particle {
+	float pos[3];
+	float radius;
+	float opacity;
 };
-BufType g_vBuf0[NUM_ELEMENTS];
-BufType g_vBuf1[NUM_ELEMENTS];
+
+std::array<Particle, THREAD_X * THREAD_Y> particlesArr;
 
 //--------------------------------------------------------------------------------------
 // Entry point to the program
 //--------------------------------------------------------------------------------------
 int __cdecl main()
 {
-    // Enable run-time memory check for debug builds.
-#ifdef _DEBUG
-    _CrtSetDbgFlag( _CRTDBG_ALLOC_MEM_DF | _CRTDBG_LEAK_CHECK_DF );
-#endif    
 
     printf( "Creating device..." );
     if ( FAILED( CreateComputeDevice( &g_pDevice, &g_pContext, false ) ) )
@@ -92,97 +94,38 @@ int __cdecl main()
     printf( "done\n" );
 
     printf( "Creating Compute Shader..." );
-    if ( FAILED( CreateComputeShader( L"compute.hlsl", "CSMain", g_pDevice, &g_pCS ) ) )
+    if ( FAILED( CreateComputeShader( L"compute.hlsl", "csComputeSelfShadowing", g_pDevice, &g_pCS ) ) )
         return 1;
     printf( "done\n" );
 
     printf( "Creating buffers and filling them with initial data..." );
-    for ( int i = 0; i < NUM_ELEMENTS; ++i ) 
-    {
-        g_vBuf0[i].i = i;
-        g_vBuf0[i].f = (float)i;
-#ifdef TEST_DOUBLE
-        g_vBuf0[i].d = (double)i;
-#endif
 
-        g_vBuf1[i].i = i;
-        g_vBuf1[i].f = (float)i;
-#ifdef TEST_DOUBLE
-        g_vBuf1[i].d = (double)i;
-#endif
-    }
-
-#ifdef USE_STRUCTURED_BUFFERS
-    CreateStructuredBuffer( g_pDevice, sizeof(BufType), NUM_ELEMENTS, &g_vBuf0[0], &g_pBuf0 );
-    CreateStructuredBuffer( g_pDevice, sizeof(BufType), NUM_ELEMENTS, &g_vBuf1[0], &g_pBuf1 );
-    CreateStructuredBuffer( g_pDevice, sizeof(BufType), NUM_ELEMENTS, nullptr, &g_pBufResult );
-#else
-    CreateRawBuffer( g_pDevice, NUM_ELEMENTS * sizeof(BufType), &g_vBuf0[0], &g_pBuf0 );
-    CreateRawBuffer( g_pDevice, NUM_ELEMENTS * sizeof(BufType), &g_vBuf1[0], &g_pBuf1 );
-    CreateRawBuffer( g_pDevice, NUM_ELEMENTS * sizeof(BufType), nullptr, &g_pBufResult );
-#endif
-
-#if defined(_DEBUG) || defined(PROFILE)
-    if ( g_pBuf0 )
-        g_pBuf0->SetPrivateData( WKPDID_D3DDebugObjectName, sizeof( "Buffer0" ) - 1, "Buffer0" );
-    if ( g_pBuf1 )
-        g_pBuf1->SetPrivateData( WKPDID_D3DDebugObjectName, sizeof( "Buffer1" ) - 1, "Buffer1" );
-    if ( g_pBufResult )
-        g_pBufResult->SetPrivateData( WKPDID_D3DDebugObjectName, sizeof( "Result" ) - 1, "Result" );
-#endif
-
-    printf( "done\n" );
-
-    printf( "Creating buffer views..." );
-    CreateBufferSRV( g_pDevice, g_pBuf0, &g_pBuf0SRV );
-    CreateBufferSRV( g_pDevice, g_pBuf1, &g_pBuf1SRV );
-    CreateBufferUAV( g_pDevice, g_pBufResult, &g_pBufResultUAV );
-
-#if defined(_DEBUG) || defined(PROFILE)
-    if ( g_pBuf0SRV )
-        g_pBuf0SRV->SetPrivateData( WKPDID_D3DDebugObjectName, sizeof( "Buffer0 SRV" ) - 1, "Buffer0 SRV" );
-    if ( g_pBuf1SRV )
-        g_pBuf1SRV->SetPrivateData( WKPDID_D3DDebugObjectName, sizeof( "Buffer1 SRV" ) - 1, "Buffer1 SRV" );
-    if ( g_pBufResultUAV )
-        g_pBufResultUAV->SetPrivateData( WKPDID_D3DDebugObjectName, sizeof( "Result UAV" ) - 1, "Result UAV" );
-#endif
+	SetUniforms();
+	CreateIOBuffers();
 
     printf( "done\n" );
 
     printf( "Running Compute Shader..." );
-    ID3D11ShaderResourceView* aRViews[2] = { g_pBuf0SRV, g_pBuf1SRV };
-    RunComputeShader( g_pContext, g_pCS, 2, aRViews, nullptr, nullptr, 0, g_pBufResultUAV, NUM_ELEMENTS, 1, 1 );
+    ID3D11ShaderResourceView* aRViews[1] = { particlesBufferSRV };
+
+	SetUniforms();
+
+    RunComputeShader( g_pContext, g_pCS, 1, aRViews, nullptr, nullptr, 0, shadowBufferUAV, constBuffer, 1, 1, 1 );
     printf( "done\n" );
 
-    // Read back the result from GPU, verify its correctness against result computed by CPU
+	// Testing
     {
-        ID3D11Buffer* debugbuf = CreateAndCopyToDebugBuf( g_pDevice, g_pContext, g_pBufResult );
+        ID3D11Buffer* debugbuf = CreateAndCopyToDebugBuf( g_pDevice, g_pContext, shadowBuffer );
         D3D11_MAPPED_SUBRESOURCE MappedResource; 
-        BufType *p;
+        float *p;
         g_pContext->Map( debugbuf, 0, D3D11_MAP_READ, 0, &MappedResource );
+        p = (float*)MappedResource.pData;
 
-        // Set a break point here and put down the expression "p, 1024" in your watch window to see what has been written out by our CS
-        // This is also a common trick to debug CS programs.
-        p = (BufType*)MappedResource.pData;
-
-        // Verify that if Compute Shader has done right
         printf( "Verifying against CPU result..." );
-        bool bSuccess = true;
-        for ( int i = 0; i < NUM_ELEMENTS; ++i )
-            if ( (p[i].i != g_vBuf0[i].i + g_vBuf1[i].i)
-                 || (p[i].f != g_vBuf0[i].f + g_vBuf1[i].f)
-#ifdef TEST_DOUBLE
-                 || (p[i].d != g_vBuf0[i].d + g_vBuf1[i].d)
-#endif
-               )
-            {
-                 printf( "failure\n" );
-                 bSuccess = false;
-
-                 break;
-            }
-        if ( bSuccess )
-            printf( "succeeded\n" );
+        bool bSuccess = false;
+		if (bSuccess) {
+			printf("succeeded\n");
+		}
 
         g_pContext->Unmap( debugbuf, 0 );
 
@@ -190,16 +133,13 @@ int __cdecl main()
     }
     
     printf( "Cleaning up...\n" );
-    SAFE_RELEASE( g_pBuf0SRV );
-    SAFE_RELEASE( g_pBuf1SRV );
-    SAFE_RELEASE( g_pBufResultUAV );
-    SAFE_RELEASE( g_pBuf0 );
-    SAFE_RELEASE( g_pBuf1 );
-    SAFE_RELEASE( g_pBufResult );
+	SAFE_RELEASE(particlesBufferSRV);
+	SAFE_RELEASE(shadowBufferUAV);
+	SAFE_RELEASE(particlesBuffer);
+	SAFE_RELEASE(shadowBuffer);
     SAFE_RELEASE( g_pCS );
     SAFE_RELEASE( g_pContext );
     SAFE_RELEASE( g_pDevice );
-
     return 0;
 }
 
@@ -421,6 +361,27 @@ HRESULT CreateRawBuffer( ID3D11Device* pDevice, UINT uSize, void* pInitData, ID3
         return pDevice->CreateBuffer( &desc, nullptr, ppBufOut );
 }
 
+HRESULT CreateConstBuffer(ID3D11Device * pDevice, UINT uSize, void * pInitData, ID3D11Buffer ** ppBufOut)
+{
+	// Fill in a buffer description.
+	D3D11_BUFFER_DESC cbDesc;
+	cbDesc.ByteWidth = uSize;
+	cbDesc.Usage = D3D11_USAGE_DYNAMIC;
+	cbDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+	cbDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+	cbDesc.MiscFlags = 0;
+	cbDesc.StructureByteStride = 0;
+
+	// Fill in the subresource data.
+	D3D11_SUBRESOURCE_DATA InitData;
+	InitData.pSysMem = pInitData;
+	InitData.SysMemPitch = 0;
+	InitData.SysMemSlicePitch = 0;
+
+	// Create the buffer.
+	return pDevice->CreateBuffer(&cbDesc, &InitData, ppBufOut);
+}
+
 //--------------------------------------------------------------------------------------
 // Create Shader Resource View for Structured or Raw Buffers
 //--------------------------------------------------------------------------------------
@@ -527,11 +488,13 @@ void RunComputeShader( ID3D11DeviceContext* pd3dImmediateContext,
                       UINT nNumViews, ID3D11ShaderResourceView** pShaderResourceViews, 
                       ID3D11Buffer* pCBCS, void* pCSData, DWORD dwNumDataBytes,
                       ID3D11UnorderedAccessView* pUnorderedAccessView,
+					  ID3D11Buffer* pConstBuffer,
                       UINT X, UINT Y, UINT Z )
 {
     pd3dImmediateContext->CSSetShader( pComputeShader, nullptr, 0 );
     pd3dImmediateContext->CSSetShaderResources( 0, nNumViews, pShaderResourceViews );
     pd3dImmediateContext->CSSetUnorderedAccessViews( 0, 1, &pUnorderedAccessView, nullptr );
+	pd3dImmediateContext->CSSetConstantBuffers(0, 1, &pConstBuffer);
     if ( pCBCS && pCSData )
     {
         D3D11_MAPPED_SUBRESOURCE MappedResource;
@@ -610,4 +573,36 @@ HRESULT FindDXSDKShaderFileCch( WCHAR* strDestPath,
     wcscpy_s( strDestPath, cchDest, strFilename );
 
     return E_FAIL;
+}
+
+void CreateIOBuffers()
+{
+
+#define frand() (static_cast <float> (rand()) / static_cast <float> (RAND_MAX))
+
+	const float sizeX{ 10.0f }, sizeY{ 10.0f }, sizeZ{ 10.0f };
+
+	for (auto & particle : particlesArr) {
+
+		particle.pos[0] = (frand() - 0.5f) * sizeX;
+		particle.pos[1] = (frand() - 0.5f) * sizeY;
+		particle.pos[2] = (frand() - 0.5f) * sizeZ;
+		particle.opacity = frand();
+		particle.opacity = frand();
+	}
+
+	CreateStructuredBuffer(g_pDevice, sizeof(Particle), particlesArr.size() , &particlesArr[0], &particlesBuffer);
+	CreateStructuredBuffer(g_pDevice, sizeof(float), particlesArr.size(), nullptr, &shadowBuffer);
+	CreateBufferSRV( g_pDevice, particlesBuffer, &particlesBufferSRV );
+	CreateBufferUAV(g_pDevice, shadowBuffer, &shadowBufferUAV);
+}
+
+void SetUniforms()
+{
+	float sunDir[4] = { 1.0f, 0.0f, 0.0f, 0.0f };
+	CreateConstBuffer(g_pDevice, sizeof(sunDir), &sunDir[0], &constBuffer);
+}
+
+void TestResult()
+{
 }
