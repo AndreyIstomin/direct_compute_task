@@ -13,6 +13,7 @@
 #include <d3d11.h>
 #include <d3dcompiler.h>
 #include <array>
+#include <assert.h>
 
 #ifndef SAFE_RELEASE
 #define SAFE_RELEASE(p)      { if (p) { (p)->Release(); (p)=nullptr; } }
@@ -61,32 +62,71 @@ ID3D11DeviceContext*        g_pContext = nullptr;
 ID3D11ComputeShader*        g_pCS = nullptr;
 
 // Particle self shadowing task
+// X - forward
+// Y - up
+// Z - right
+
 ID3D11Buffer* particlesBuffer = nullptr;
 ID3D11Buffer* shadowBuffer = nullptr;
 ID3D11Buffer* constBuffer = nullptr;
 ID3D11ShaderResourceView* particlesBufferSRV = nullptr;
 ID3D11UnorderedAccessView*  shadowBufferUAV = nullptr;
 
-#define THREAD_X 32
-#define THREAD_Y 32
-
-void CreateIOBuffers();
-void SetUniforms();
-void TestResult();
+struct Pos {
+	float x, y, z;
+};
 
 struct Particle {
-	float pos[3];
+	Pos pos;
 	float radius;
 	float opacity;
 };
 
+float Smoothstep(float edge0, float edge1, float value) {
+	const float t = min(max((value - edge0) / (edge1 - edge0), 0.0f), 1.0f);
+	return t * t * (3.0 - 2.0 * t);
+}
+
+float Overlap(float dir[4], const Particle & caster, const Particle & receiver) {
+	
+	const float dReceiver{ dir[0] * receiver.pos.x + dir[1] * receiver.pos.y + dir[2] * receiver.pos.z };
+	const float dCaster{ dir[0] * caster.pos.x + dir[1] * caster.pos.y + dir[2] * caster.pos.z };
+
+	if (dCaster < dReceiver) {
+		return 0.0f;
+	}
+
+	const Pos posReceiever{ receiver.pos.x - dir[0] * dReceiver, receiver.pos.y - dir[1] * dReceiver, receiver.pos.z - dir[2] * dReceiver };
+	const Pos posCaster{ caster.pos.x - dir[0] * dCaster, caster.pos.y - dir[1] * dCaster, caster.pos.z - dir[2] * dCaster};
+
+	const float dist = sqrtf(
+		(posReceiever.x - posCaster.x) * (posReceiever.x - posCaster.x) +
+		(posReceiever.y - posCaster.y) * (posReceiever.y - posCaster.y) +
+		(posReceiever.z - posCaster.z) * (posReceiever.z - posCaster.z));
+
+	return caster.opacity * min(caster.radius * caster.radius / (receiver.radius * receiver.radius), 1.0f) * Smoothstep(receiver.radius + caster.radius, abs(receiver.radius - caster.radius), dist);
+}
+
+
+#define THREAD_X 32
+#define THREAD_Y 32
+
 std::array<Particle, THREAD_X * THREAD_Y> particlesArr;
+
+void CreateIOBuffers();
+void SetUniforms();
+void TestOverlapHost();
+void TestResult();
 
 //--------------------------------------------------------------------------------------
 // Entry point to the program
 //--------------------------------------------------------------------------------------
 int __cdecl main()
 {
+	printf("Test covering function...");
+	TestOverlapHost();
+	printf("done\n");
+
 
     printf( "Creating device..." );
     if ( FAILED( CreateComputeDevice( &g_pDevice, &g_pContext, false ) ) )
@@ -584,9 +624,9 @@ void CreateIOBuffers()
 
 	for (auto & particle : particlesArr) {
 
-		particle.pos[0] = (frand() - 0.5f) * sizeX;
-		particle.pos[1] = (frand() - 0.5f) * sizeY;
-		particle.pos[2] = (frand() - 0.5f) * sizeZ;
+		particle.pos.x = (frand() - 0.5f) * sizeX;
+		particle.pos.y = (frand() - 0.5f) * sizeY;
+		particle.pos.z = (frand() - 0.5f) * sizeZ;
 		particle.opacity = frand();
 		particle.opacity = frand();
 	}
@@ -601,6 +641,53 @@ void SetUniforms()
 {
 	float sunDir[4] = { 1.0f, 0.0f, 0.0f, 0.0f };
 	CreateConstBuffer(g_pDevice, sizeof(sunDir), &sunDir[0], &constBuffer);
+}
+
+void TestOverlapHost()
+{
+	const float diff{ 1e-6f };
+	{
+		float sunSir[4] = { 1.0f, 0.0f, 0.0f, 0.0f };
+		Particle receiver{ {0.0f, 0.0f, 0.0f}, 1.0f, 1.0f };
+		Particle caster{ {2.0f, 0.0f, 0.0f}, 0.5f, 0.5f };
+
+		const float result = Overlap(sunSir, caster, receiver);
+		const float expected = 0.5f * (0.5*0.5 / 1.0f * 1.0f);
+
+		assert(abs( result - expected ) < diff, "Full intercetion (caster < receiver)");
+	}
+	{
+		float sunSir[4] = { 1.0f, 0.0f, 0.0f, 0.0f };
+		Particle receiver{ {0.0f, 0.0f, 0.0f}, 0.9f, 1.0f };
+		Particle caster{ {2.0f, 0.0f, 0.0f}, 1.0f, 0.5f };
+
+		const float result = Overlap(sunSir, caster, receiver);
+		const float expected = 0.5f;
+
+		assert(abs(result - expected) < diff, "Full intersection (cater > receiver)");
+	}
+	{
+		float sunSir[4] = { 0.0f, 1.0f, 0.0f, 0.0f };
+		Particle receiver{ {0.0f, 0.0f, 0.0f}, 1.0f, 1.0f };
+		Particle caster{ {2.0f, 0.0f, 0.0f}, 0.5f, 0.5f };
+
+		const float result = Overlap(sunSir, caster, receiver);
+		const float expected = 0.0f;
+
+		assert(abs(result - expected) < diff, "No intersection");
+	}
+
+	{
+		float sunSir[4] = { 1.0f, 0.0f, 0.0f, 0.0f };
+		Particle receiver{ {0.0f, 0.0f, 0.0f}, 1.0f, 1.0f };
+		Particle caster{ {2.0f, 1.0f, 0.0f}, 1.0f, 0.5f };
+
+		const float result = Overlap(sunSir, caster, receiver);
+		const float expected = 0.5f * 0.5f;
+
+		assert(abs(result - expected) < diff, "Part intersection");
+	}
+
 }
 
 void TestResult()
