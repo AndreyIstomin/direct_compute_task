@@ -37,7 +37,7 @@ void csComputeSelfShadowing(uint tid : SV_GroupIndex)
 {
 	float result = 1.0f;
 	const uint N = THREAD_X * THREAD_Y;
-	const float3 sunZ = normalize(cross(sunDir, float3(0.0f, 1.0f, 0.0f))); // Допускаю, что sunDir не колинеарен Y
+	const float3 sunZ = normalize(cross(sunDir, float3(0.0f, 1.0f, 0.0f))); // Suppose the sunDir and Y are not collinear
 	const float3 sunY = cross(sunZ, sunDir);
 
 
