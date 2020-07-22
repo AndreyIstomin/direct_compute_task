@@ -14,6 +14,7 @@
 #include <d3dcompiler.h>
 #include <array>
 #include <assert.h>
+#include <chrono>
 
 #ifndef SAFE_RELEASE
 #define SAFE_RELEASE(p)      { if (p) { (p)->Release(); (p)=nullptr; } }
@@ -112,11 +113,12 @@ float Overlap(float dir[4], const Particle & caster, const Particle & receiver) 
 #define THREAD_Y 32
 
 std::array<Particle, THREAD_X * THREAD_Y> particlesArr;
+float sunDir[4];
 
 void CreateIOBuffers();
 void SetUniforms();
 void TestOverlapHost();
-void TestResult();
+void TestResult(float result[THREAD_X * THREAD_Y]);
 
 //--------------------------------------------------------------------------------------
 // Entry point to the program
@@ -126,7 +128,6 @@ int __cdecl main()
 	printf("Test covering function...");
 	TestOverlapHost();
 	printf("done\n");
-
 
     printf( "Creating device..." );
     if ( FAILED( CreateComputeDevice( &g_pDevice, &g_pContext, false ) ) )
@@ -140,7 +141,6 @@ int __cdecl main()
 
     printf( "Creating buffers and filling them with initial data..." );
 
-	SetUniforms();
 	CreateIOBuffers();
 
     printf( "done\n" );
@@ -149,7 +149,6 @@ int __cdecl main()
     ID3D11ShaderResourceView* aRViews[1] = { particlesBufferSRV };
 
 	SetUniforms();
-
     RunComputeShader( g_pContext, g_pCS, 1, aRViews, nullptr, nullptr, 0, shadowBufferUAV, constBuffer, 1, 1, 1 );
     printf( "done\n" );
 
@@ -162,10 +161,10 @@ int __cdecl main()
         p = (float*)MappedResource.pData;
 
         printf( "Verifying against CPU result..." );
-        bool bSuccess = false;
-		if (bSuccess) {
-			printf("succeeded\n");
-		}
+        
+		TestResult(p);
+
+		printf("done\n");
 
         g_pContext->Unmap( debugbuf, 0 );
 
@@ -180,6 +179,10 @@ int __cdecl main()
     SAFE_RELEASE( g_pCS );
     SAFE_RELEASE( g_pContext );
     SAFE_RELEASE( g_pDevice );
+
+	printf("done\n");
+
+	std::getchar();
     return 0;
 }
 
@@ -545,7 +548,54 @@ void RunComputeShader( ID3D11DeviceContext* pd3dImmediateContext,
         pd3dImmediateContext->CSSetConstantBuffers( 0, 1, ppCB );
     }
 
+	//auto begin = std::chrono::high_resolution_clock::now();
+	LARGE_INTEGER start, stop, freq;
+	QueryPerformanceCounter(&start);
+
+	//
+	// 1. Create an event query from the current device
+	D3D11_QUERY_DESC queryDesc1;
+	queryDesc1.Query = D3D11_QUERY_TIMESTAMP_DISJOINT;
+	queryDesc1.MiscFlags = 0;
+	ID3D11Query * pQuery1;
+
+	D3D11_QUERY_DESC queryDesc2;
+	queryDesc2.Query = D3D11_QUERY_TIMESTAMP;
+	queryDesc2.MiscFlags = 0;
+	ID3D11Query * pQuery2;
+
+	D3D11_QUERY_DESC queryDesc3;
+	queryDesc3.Query = D3D11_QUERY_TIMESTAMP;
+	queryDesc3.MiscFlags = 0;
+	ID3D11Query * pQuery3;
+
+	HRESULT res;
+	res = g_pDevice->CreateQuery(&queryDesc1, &pQuery1);
+	res = g_pDevice->CreateQuery(&queryDesc2, &pQuery2);
+	res = g_pDevice->CreateQuery(&queryDesc3, &pQuery3);
+
+	pd3dImmediateContext->Begin(pQuery1);
+	pd3dImmediateContext->End(pQuery2);
+
     pd3dImmediateContext->Dispatch( X, Y, Z );
+
+	pd3dImmediateContext->End(pQuery3);
+	pd3dImmediateContext->End(pQuery1);
+
+	D3D11_QUERY_DATA_TIMESTAMP_DISJOINT queryData1;
+	UINT64 queryData2, queryData3;
+
+	while (true)
+	{
+		res = pd3dImmediateContext->GetData(pQuery1, &queryData1, sizeof(queryData1), 0);
+		if (res == S_OK) {
+			break;
+		}
+	}
+	res = pd3dImmediateContext->GetData(pQuery2, &queryData2, sizeof(queryData2), 0);
+	res = pd3dImmediateContext->GetData(pQuery3, &queryData3, sizeof(queryData3), 0);
+
+	printf("elapsed GPU time: %d microsecods\n", ((queryData3 - queryData2) * 1000000) / queryData1.Frequency);
 
     pd3dImmediateContext->CSSetShader( nullptr, nullptr, 0 );
 
@@ -620,14 +670,22 @@ void CreateIOBuffers()
 
 #define frand() (static_cast <float> (rand()) / static_cast <float> (RAND_MAX))
 
+	const float revLen = 1.0f / sqrtf(0.5f * 0.5f + 0.2f * 0.2f + 0.3f * 0.3f);
+
+	sunDir[0] = 0.5f * revLen;
+	sunDir[1] = 0.2f * revLen;
+	sunDir[2] = 0.3f * revLen;
+	sunDir[3] = 0.0f;
+
 	const float sizeX{ 10.0f }, sizeY{ 10.0f }, sizeZ{ 10.0f };
+
 
 	for (auto & particle : particlesArr) {
 
 		particle.pos.x = (frand() - 0.5f) * sizeX;
 		particle.pos.y = (frand() - 0.5f) * sizeY;
 		particle.pos.z = (frand() - 0.5f) * sizeZ;
-		particle.opacity = frand();
+		particle.radius = frand();
 		particle.opacity = frand();
 	}
 
@@ -639,7 +697,6 @@ void CreateIOBuffers()
 
 void SetUniforms()
 {
-	float sunDir[4] = { 1.0f, 0.0f, 0.0f, 0.0f };
 	CreateConstBuffer(g_pDevice, sizeof(sunDir), &sunDir[0], &constBuffer);
 }
 
@@ -690,6 +747,26 @@ void TestOverlapHost()
 
 }
 
-void TestResult()
+void TestResult(float result[THREAD_X * THREAD_Y])
 {
+	static std::array<float, THREAD_X * THREAD_Y> expected;
+
+	const float diff{ 1e-5f };
+
+	auto begin = std::chrono::high_resolution_clock::now();
+	for (size_t i = 0; i < expected.size(); ++i) {
+		expected[i] = 1.0f;
+		for (size_t j = 0; j < expected.size(); ++j) {
+
+			if (i != j) {
+				expected[i] *= 1.0f - Overlap(sunDir, particlesArr[j], particlesArr[i]);
+			}
+		}
+	}
+	printf("elapsed CPU time: %d milliseconds\n",
+		(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::high_resolution_clock::now() - begin)).count());
+
+	for (size_t i = 0; i < expected.size(); ++i) {
+		assert(abs(result[i] - expected[i]) < diff);
+	}
 }
